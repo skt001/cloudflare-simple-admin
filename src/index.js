@@ -190,6 +190,10 @@ async function deletePost(db, no) {
   if (!post) return notFound();
   // 物理削除は末尾のみ。途中を消すと欠番になり、番号を持たない dat の行位置と
   // レス番号がずれるため、最大番号でない指定は拒否する(あぼーんの no >= 2 と同じ考え方)。
+  // 1 番も対象外(あぼーんと同じ)。1 番ごと消す場合は「1含めて初期化」を使う。
+  if (no === 1) {
+    return redirectWithMessage("1 番は物理削除できません(消す場合は「1含めて初期化」を使ってください)");
+  }
   const max = await db.prepare("SELECT COALESCE(MAX(no), 0) AS m FROM posts").first();
   if (no !== max.m) {
     return redirectWithMessage(`${no} 番は末尾ではないため物理削除できません`);
@@ -316,7 +320,7 @@ async function chSection(db) {
     <td>${p.no}</td><td>${escapeHtml(p.name)}</td><td>${escapeHtml(p.mail)}</td>
     <td>${escapeHtml(p.date_text)}</td><td>${escapeHtml(p.poster_id)}</td>
     <td class="msg">${escapeHtml(p.message)}</td>
-    <td>${p.no >= 2 ? `<form method="post" action="/2ch/posts/${p.no}/abon" onsubmit="return confirm('${p.no} 番をあぼーんしますか？')"><button type="submit">あぼーん</button></form> ` : ""}${thread && p.no === thread.lastNo ? `<form method="post" action="/2ch/posts/${p.no}/delete" onsubmit="return confirm('${p.no} 番(末尾)を物理削除しますか？')"><button type="submit">物理削除</button></form>` : ""}</td>
+    <td>${p.no >= 2 ? `<form method="post" action="/2ch/posts/${p.no}/abon" onsubmit="return confirm('${p.no} 番をあぼーんしますか？')"><button type="submit">あぼーん</button></form> ` : ""}${thread && p.no >= 2 && p.no === thread.lastNo ? `<form method="post" action="/2ch/posts/${p.no}/delete" onsubmit="return confirm('${p.no} 番(末尾)を物理削除しますか？')"><button type="submit">物理削除</button></form>` : ""}</td>
   </tr>`).join("\n");
   if (!thread || thread.count === 0) {
     return `<h2>2ch</h2>

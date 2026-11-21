@@ -106,6 +106,18 @@ test("2ch 物理削除: 存在しない番号は 404", async () => {
   assert.equal(response.status, 404);
 });
 
+test("2ch 物理削除: レスが 1 件だけのとき 1 番は消せず、ボタンも出ない", async () => {
+  const env = seededEnv();
+  const db = env.simple_2ch_db.sqlite;
+  db.exec("DELETE FROM posts WHERE no >= 2");
+  db.exec("DELETE FROM dat_lines WHERE no >= 2");
+  const html = await (await call(env, "/")).text();
+  assert.ok(!html.includes("/2ch/posts/1/delete"));
+  const response = await call(env, "/2ch/posts/1/delete", { method: "POST" });
+  assert.equal(response.status, 303);
+  assert.equal(db.prepare("SELECT COUNT(*) AS c FROM posts WHERE no = 1").get().c, 1);
+});
+
 test("未知のパスは 404", async () => {
   assert.equal((await call(seededEnv(), "/nope")).status, 404);
 });
