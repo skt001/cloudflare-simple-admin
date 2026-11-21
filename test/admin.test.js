@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { FILE_BYTES, FILE_ID, FakeD1, call, makeEnv, seed2ch, seedUploader } from "./helpers.js";
+import { FILE_BYTES, FILE_ID, FakeD1, TEST_PASSWORD, call, callRaw, makeEnv, seed2ch, seedUploader } from "./helpers.js";
 
 function seededEnv() {
   const env = makeEnv();
@@ -205,4 +205,61 @@ test("バインディング自体がない側も未対応になる", async () =>
   assert.ok(html.includes("未対応です"));
   assert.ok(html.includes("テストスレ"));
   assert.equal((await call(env, "/uploader/reset")).status, 503);
+});
+
+function basic(id, password) {
+  return { headers: { Authorization: "Basic " + Buffer.from(`${id}:${password}`).toString("base64") } };
+}
+
+function accessRows(env) {
+  return env.simple_admin_db.sqlite.prepare("SELECT login_id, ok, path FROM access_log ORDER BY id").all();
+}
+
+test("認証: 資格情報なしは 401 で、記録もされない", async () => {
+  const env = seededEnv();
+  const response = await callRaw(env, "/");
+  assert.equal(response.status, 401);
+  assert.ok(response.headers.get("WWW-Authenticate").includes("Basic"));
+  assert.equal(accessRows(env).length, 0);
+});
+
+test("認証: メールっぽい ID と正しいパスワードで入り、成功が記録される", async () => {
+  const env = seededEnv();
+  const response = await callRaw(env, "/", basic("someone@example.co.jp", TEST_PASSWORD));
+  assert.equal(response.status, 200);
+  const rows = accessRows(env);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].login_id, "someone@example.co.jp");
+  assert.equal(rows[0].ok, 1);
+  assert.equal(rows[0].path, "/");
+});
+
+test("認証: パスワード違いは 401 で、失敗が記録される", async () => {
+  const env = seededEnv();
+  const response = await callRaw(env, "/", basic("someone@example.co.jp", "wrong-password"));
+  assert.equal(response.status, 401);
+  const rows = accessRows(env);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].ok, 0);
+});
+
+test("認証: @ の後ろにピリオドがない ID は、正しいパスワードでも 401", async () => {
+  const env = seededEnv();
+  assert.equal((await callRaw(env, "/", basic("someone@localhost", TEST_PASSWORD))).status, 401);
+  assert.equal((await callRaw(env, "/", basic("admin", TEST_PASSWORD))).status, 401);
+});
+
+test("認証: ADMIN_PASSWORD 未設定なら 503 で全て拒否", async () => {
+  const env = seededEnv();
+  delete env.ADMIN_PASSWORD;
+  assert.equal((await callRaw(env, "/", basic("someone@example.co.jp", TEST_PASSWORD))).status, 503);
+});
+
+test("ダッシュボード: アクセスログに記録が表示される", async () => {
+  const env = seededEnv();
+  await callRaw(env, "/", basic("visitor@example.com", "bad"));
+  const html = await (await call(env, "/")).text();
+  assert.ok(html.includes("アクセスログ"));
+  assert.ok(html.includes("visitor@example.com"));
+  assert.ok(html.includes("失敗"));
 });

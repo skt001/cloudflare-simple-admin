@@ -3,11 +3,21 @@
 cloudflare-simple-uploader と cloudflare-simple-2ch のための GUI 管理 Worker です。
 各アプリ本体には管理画面を持たせず、この Worker に集約します。
 
-## 警告(認証について)
+## 認証について
 
-**この Worker 自体に認証はありません。** 全ファイルの強制ダウンロード・強制削除、
-掲示板のあぼーん・物理削除ができるため、**前段に Cloudflare Access を設定するまで
-公開デプロイしないでください。** Access の設定が前提の運用です。
+HTTP Basic 認証をかけています。
+
+- ID: メールアドレスっぽい文字列なら何でも構いません(@ の後ろにピリオドが
+  1つあるかだけを正規表現で確認します)。許可リストはありません
+- パスワード: デプロイ時に `wrangler secret put ADMIN_PASSWORD` で設定した
+  ものと照合します。**実質はパスワードのみの認証です。** ID は、誰が入ったかを
+  ログに残すための名乗りとして扱います(admin や root の固定 ID よりはマシ、
+  という位置づけです)
+- シークレットが未設定の場合、この Worker は全てのリクエストを 503 で拒否します
+- ログイン試行(資格情報を持ったリクエスト)は admin 専用の D1 `simple-admin-db` の
+  `access_log` に記録され、ダッシュボードの「アクセスログ」で最新100件を見られます
+- Basic 認証のため、ログアウトはできません。総当たりへのレート制限もありません
+  (失敗は全件ログに残ります)
 
 ## できる操作
 
@@ -30,32 +40,40 @@ cloudflare-simple-uploader と cloudflare-simple-2ch のための GUI 管理 Wor
   - 1含めて初期化: 全レスとスレッドを削除し、初期化前の状態に戻します(確認画面あり)
   - 1 番の作成: スレッドがないときだけダッシュボードにフォームが出ます。init.sql と同じく
     thread と 1 番(名無しさん / ID: Admin001)を作成します。日付は実行時点の JST です
+- アクセスログ: ログイン試行の記録(日時・ID・成功/失敗・IP・パス・User-Agent)を
+  ダッシュボードに表示します(最新100件)
 
 ## セットアップ
 
 前提: uploader と 2ch がデプロイ済みで、D1 データベース
 `simple-uploader-db` と `simple-2ch-db` が存在すること。
 
+まず設定ファイルをコピーし、アクセスログ用の D1 を作ります。作成の際、
+Wrangler が `wrangler.jsonc` へ `d1_databases` を追記するので、提案を受け入れて
+ください(バインディング名は DB 名から生成される `simple_admin_db` で、
+コードはこの名前を使います)。その後、スキーマを適用します。
+
 ```sh
 cp wrangler.example.jsonc wrangler.jsonc
-npx wrangler d1 list   # 2つのデータベースの id を確認する
+npx wrangler d1 create simple-admin-db
+npx wrangler d1 execute simple-admin-db --remote --file ./admin-db.sql
+npx wrangler d1 list   # 既存の2つのデータベースの id を確認する
 ```
 
-コピーした `wrangler.jsonc` の `d1_databases` にある2か所の
-`database_id` のプレースホルダを、確認した id に置き換えます
+`wrangler.jsonc` の `d1_databases` に残っている2か所の `database_id` の
+プレースホルダを、確認した id に置き換えます
 (`simple-uploader-db` と `simple-2ch-db` を取り違えないよう注意)。
+追記された `simple_admin_db` のエントリは実 ID 入りなので、そのまま使います。
 
 片方しか使わない、または片方の id が間違っている場合、その側はダッシュボードで
 「未対応」と表示され、その側の操作は 503 になります。もう片方はそのまま使えます。
 
-デプロイと Access の設定:
+最後に、パスワードのシークレットを設定してデプロイします。
 
 ```sh
+npx wrangler secret put ADMIN_PASSWORD
 npx wrangler deploy
 ```
-
-デプロイ後、Cloudflare Zero Trust の Access で、この Worker のホスト名に対する
-アプリケーションを作成し、許可するメールアドレスだけが到達できるようにしてください。
 
 ## テスト
 

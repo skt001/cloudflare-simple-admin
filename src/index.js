@@ -1,7 +1,9 @@
 // admin: cloudflare-simple-uploader と cloudflare-simple-2ch の管理用 Worker。
 //
-// 認証はこの Worker には実装しない。前段に Cloudflare Access を置く前提で、
-// Access を設定するまでは公開デプロイしないこと(README 参照)。
+// 認証は HTTP Basic 認証。ID はメールアドレスっぽい文字列なら何でもよく
+// (@ の後ろにピリオドがあるか程度だけを正規表現で見る)、実質はパスワードのみで
+// 認証する。パスワードは ADMIN_PASSWORD シークレットと照合し、未設定なら全て
+// 拒否する。ログイン試行は simple_admin_db の access_log に残す(README 参照)。
 // 管理操作は各プロジェクトの ADMIN.md の手順(SQL)を、そのまま GUI から実行する:
 // - uploader のファイル削除は files の行削除のみ(残りは ON DELETE CASCADE が消す)
 // - 2ch のあぼーんは posts の書き換えのみ(dat キャッシュには触れない)
@@ -67,6 +69,55 @@ function unavailablePage(name) {
 <p>${escapeHtml(name)} のデータベースに接続できませんでした。wrangler.jsonc の database_id が対象のデータベースを指していない可能性があります。</p>
 <p><a href="/">ダッシュボードへ戻る</a></p>
 `, 503);
+}
+
+// ---------- 認証 ----------
+
+// メールアドレスっぽさの判定はこれだけ(@ の後ろにピリオドが1つあること)。
+// 許可リストはなく、ID はログに残すための名乗りとして扱う。実質の認証はパスワードのみ。
+const EMAIL_LIKE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function parseBasicAuth(request) {
+  const header = request.headers.get("Authorization") ?? "";
+  const match = /^Basic\s+(.+)$/i.exec(header);
+  if (!match) return null;
+  let decoded;
+  try {
+    const binary = atob(match[1]);
+    const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+    decoded = new TextDecoder().decode(bytes);
+  } catch {
+    return null;
+  }
+  const idx = decoded.indexOf(":");
+  if (idx < 0) return null;
+  return { id: decoded.slice(0, idx), password: decoded.slice(idx + 1) };
+}
+
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function passwordMatches(input, expected) {
+  const [a, b] = await Promise.all([sha256Hex(input), sha256Hex(expected)]);
+  return a === b;
+}
+
+async function logAccess(db, request, url, loginId, ok) {
+  if (!db) return;
+  try {
+    await db.prepare("INSERT INTO access_log (at, login_id, ok, ip, path, user_agent) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind(
+        Date.now(), loginId, ok ? 1 : 0,
+        request.headers.get("CF-Connecting-IP") ?? "",
+        url.pathname,
+        request.headers.get("User-Agent") ?? "",
+      )
+      .run();
+  } catch {
+    // ログの失敗で認証や操作自体は止めない。
+  }
 }
 
 function redirectWithMessage(message) {
@@ -274,12 +325,37 @@ async function dashboard(env, url) {
   const msg = url.searchParams.get("msg");
   const up = await uploaderSection(env.simple_uploader_db);
   const bbs = await chSection(env.simple_2ch_db);
+  const log = await accessLogSection(env.simple_admin_db);
   return page("admin", `
 <h1>admin</h1>
 ${msg ? `<p class="flash">${escapeHtml(msg)}</p>` : ""}
 ${up}
 ${bbs}
+${log}
 `);
+}
+
+async function accessLogSection(db) {
+  if (!db) return `<h2>アクセスログ</h2>\n<p>未対応です(バインディング simple_admin_db がありません)。</p>`;
+  let rows;
+  try {
+    ({ results: rows } = await db.prepare(
+      "SELECT at, login_id, ok, ip, path, user_agent FROM access_log ORDER BY id DESC LIMIT ?",
+    ).bind(LIST_LIMIT).all());
+  } catch (error) {
+    if (!isDbUnavailable(error)) throw error;
+    return `<h2>アクセスログ</h2>\n<p>未対応です(データベースに接続できませんでした。database_id が simple-admin-db を指しているか確認してください)。</p>`;
+  }
+  const trs = rows.map((r) => `<tr>
+    <td>${formatJst(r.at)}</td><td>${escapeHtml(r.login_id)}</td><td>${r.ok ? "成功" : "失敗"}</td>
+    <td>${escapeHtml(r.ip)}</td><td>${escapeHtml(r.path)}</td><td>${escapeHtml(r.user_agent)}</td>
+  </tr>`).join("\n");
+  return `<h2>アクセスログ</h2>
+<p>ログイン試行の記録です。最新 ${LIST_LIMIT} 件まで表示します。</p>
+<table>
+<tr><th>日時(JST)</th><th>ID</th><th>結果</th><th>IP</th><th>パス</th><th>User-Agent</th></tr>
+${trs}
+</table>`;
 }
 
 async function uploaderSection(db) {
@@ -404,7 +480,33 @@ async function route(request, env, url) {
 export default {
   async fetch(request, env) {
     try {
-      return await route(request, env, new URL(request.url));
+      const url = new URL(request.url);
+      // パスワードのシークレットが未設定なら、開かずに全て拒否する(フェイルクローズ)。
+      if (typeof env.ADMIN_PASSWORD !== "string" || env.ADMIN_PASSWORD === "") {
+        return new Response("認証が設定されていません(ADMIN_PASSWORD シークレットが未設定です)。\n", {
+          status: 503,
+          headers: { "Content-Type": "text/plain; charset=UTF-8", "Cache-Control": "no-store" },
+        });
+      }
+      const credentials = parseBasicAuth(request);
+      const ok = credentials !== null
+        && EMAIL_LIKE.test(credentials.id)
+        && (await passwordMatches(credentials.password, env.ADMIN_PASSWORD));
+      // 資格情報を持ったリクエスト(=ログイン試行)だけを記録する。
+      if (request.headers.get("Authorization")) {
+        await logAccess(env.simple_admin_db, request, url, credentials?.id ?? "", ok);
+      }
+      if (!ok) {
+        return new Response("認証が必要です。\n", {
+          status: 401,
+          headers: {
+            "WWW-Authenticate": 'Basic realm="admin", charset="UTF-8"',
+            "Content-Type": "text/plain; charset=UTF-8",
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+      return await route(request, env, url);
     } catch (error) {
       console.error(error);
       return new Response("サーバーでエラーが発生しました。\n", {

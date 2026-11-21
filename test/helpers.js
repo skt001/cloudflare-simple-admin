@@ -53,15 +53,30 @@ export class FakeD1 {
 
 export const ORIGIN = "https://admin.example.test";
 
+export const TEST_PASSWORD = "test-password";
+export const TEST_ID = "tester@example.com";
+
 export function makeEnv() {
   return {
     simple_uploader_db: new FakeD1("uploader.sql"),
     simple_2ch_db: new FakeD1("2ch.sql"),
+    simple_admin_db: new FakeD1("admin.sql"),
+    ADMIN_PASSWORD: TEST_PASSWORD,
   };
 }
 
-export async function call(env, path, options = {}) {
+// 認証なしで呼ぶ(認証まわりのテスト用)。
+export async function callRaw(env, path, options = {}) {
   return worker.fetch(new Request(new URL(path, ORIGIN), options), env);
+}
+
+// 通常の呼び出しは、テスト用の ID とパスワードで Basic 認証を通す。
+export async function call(env, path, options = {}) {
+  const headers = new Headers(options.headers);
+  if (!headers.has("Authorization")) {
+    headers.set("Authorization", "Basic " + Buffer.from(`${TEST_ID}:${TEST_PASSWORD}`).toString("base64"));
+  }
+  return callRaw(env, path, { ...options, headers });
 }
 
 // uploader: パスワード・削除キー付きの公開済みファイル(チャンク2つ)と、
