@@ -1,4 +1,4 @@
-// simple-admin: cloudflare-simple-uploader と cloudflare-simple-2ch の管理用 Worker。
+// admin: cloudflare-simple-uploader と cloudflare-simple-2ch の管理用 Worker。
 //
 // 認証はこの Worker には実装しない。前段に Cloudflare Access を置く前提で、
 // Access を設定するまでは公開デプロイしないこと(README 参照)。
@@ -274,8 +274,8 @@ async function dashboard(env, url) {
   const msg = url.searchParams.get("msg");
   const up = await uploaderSection(env.simple_uploader_db);
   const bbs = await chSection(env.simple_2ch_db);
-  return page("simple-admin", `
-<h1>simple-admin</h1>
+  return page("admin", `
+<h1>admin</h1>
 ${msg ? `<p class="flash">${escapeHtml(msg)}</p>` : ""}
 ${up}
 ${bbs}

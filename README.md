@@ -1,4 +1,4 @@
-# simple-admin
+# admin
 
 cloudflare-simple-uploader と cloudflare-simple-2ch のための GUI 管理 Worker です。
 各アプリ本体には管理画面を持たせず、この Worker に集約します。

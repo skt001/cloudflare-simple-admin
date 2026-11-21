@@ -2,7 +2,7 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"compatibility_date": "2026-11-12",
 	"main": "src/index.js",
-	"name": "simple-admin",
+	"name": "admin",
 	"d1_databases": [
 		{
 			"binding": "simple_uploader_db",
