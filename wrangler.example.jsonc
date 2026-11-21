@@ -1,1 +1,18 @@
-{"$schema":"node_modules/wrangler/config-schema.json","compatibility_date":"2026-11-12","main":"src/index.js","name":"simple-admin"}
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"compatibility_date": "2026-11-12",
+	"main": "src/index.js",
+	"name": "simple-admin",
+	"d1_databases": [
+		{
+			"binding": "simple_uploader_db",
+			"database_name": "simple-uploader-db",
+			"database_id": "<wrangler d1 list で確認した id>"
+		},
+		{
+			"binding": "simple_2ch_db",
+			"database_name": "simple-2ch-db",
+			"database_id": "<wrangler d1 list で確認した id>"
+		}
+	]
+}

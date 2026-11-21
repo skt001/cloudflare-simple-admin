@@ -5,7 +5,10 @@
 // 管理操作は各プロジェクトの ADMIN.md の手順(SQL)を、そのまま GUI から実行する:
 // - uploader のファイル削除は files の行削除のみ(残りは ON DELETE CASCADE が消す)
 // - 2ch のあぼーんは posts の書き換えのみ(dat キャッシュには触れない)
-// - 2ch の物理削除は posts と dat_lines の両方から消す(dat は dat_lines を直接読むため)
+// - 2ch の物理削除は末尾のレスのみ(posts と dat_lines の両方から消す)。
+//   途中を消すと dat の行位置とレス番号がずれるため、対象を末尾に限る
+// 左右は独立に扱う。片方の database_id が間違っている(プレースホルダのまま等)場合、
+// その側は 500 にせず「未対応」と表示し、もう片方は使える状態に保つ。
 
 const HTML_TYPE = "text/html; charset=UTF-8";
 const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
@@ -26,12 +29,21 @@ function formatJst(ms) {
   return `${d.getUTCFullYear()}/${pad(d.getUTCMonth() + 1)}/${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 
-function page(title, body) {
+const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
+
+// 2ch 本体の formatJst と同じ表示形式(YYYY/MM/DD(曜) HH:MM:SS、JST)。
+function formatDateText(ms) {
+  const d = new Date(ms + JST_OFFSET_MS);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${String(d.getUTCFullYear()).padStart(4, "0")}/${pad(d.getUTCMonth() + 1)}/${pad(d.getUTCDate())}(${WEEKDAYS[d.getUTCDay()]}) ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+function page(title, body, status = 200) {
   return new Response(
     `<!doctype html>\n<html lang="ja">\n<head>\n<meta charset="UTF-8">\n<title>${escapeHtml(title)}</title>\n` +
     `<style>body{font-family:sans-serif;margin:2em;max-width:1100px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top}td.msg{white-space:pre-wrap;word-break:break-all}.flash{background:#eef7ee;border:1px solid #9c9;padding:8px 12px}form{display:inline}</style>\n` +
     `</head>\n<body>\n${body}\n</body>\n</html>\n`,
-    { status: 200, headers: { "Content-Type": HTML_TYPE, "Cache-Control": "no-store" } },
+    { status, headers: { "Content-Type": HTML_TYPE, "Cache-Control": "no-store" } },
   );
 }
 
@@ -42,11 +54,37 @@ function notFound() {
   });
 }
 
+// database_id の間違い(プレースホルダのまま・取り違え等)で、対象のデータベースに
+// 繋がっていない状態かどうか。対象外の DB ではテーブル自体が存在しない。
+function isDbUnavailable(error) {
+  const message = String(error?.message ?? error);
+  return /no such table|no such column|D1_ERROR|Couldn't find DB|no such database/i.test(message);
+}
+
+function unavailablePage(name) {
+  return page("未対応", `
+<h1>未対応</h1>
+<p>${escapeHtml(name)} のデータベースに接続できませんでした。wrangler.jsonc の database_id が対象のデータベースを指していない可能性があります。</p>
+<p><a href="/">ダッシュボードへ戻る</a></p>
+`, 503);
+}
+
 function redirectWithMessage(message) {
   return new Response(null, {
     status: 303,
     headers: { Location: `/?msg=${encodeURIComponent(message)}`, "Cache-Control": "no-store" },
   });
+}
+
+// 初期化系(影響範囲が全体)のための確認画面。対象の説明と実行ボタンのみを出す。
+function confirmPage(heading, description, action) {
+  return page(heading, `
+<h1>${escapeHtml(heading)}</h1>
+<p>${escapeHtml(description)}</p>
+<p>この操作は取り消せません。</p>
+<form method="post" action="${action}"><button type="submit">実行する</button></form>
+<p><a href="/">キャンセルして戻る</a></p>
+`);
 }
 
 // ---------- uploader ----------
@@ -106,6 +144,20 @@ async function forceDeleteFile(db, id) {
   return redirectWithMessage(`ファイル ${id} を削除しました`);
 }
 
+async function resetUploaderConfirm(db) {
+  const summary = await uploaderSummary(db);
+  return confirmPage(
+    "uploader 初期化",
+    `全 ${summary.total} 件のファイル(合計 ${summary.bytes} バイト)を削除し、空の状態に戻します。アップロード中の予約も消えます。`,
+    "/uploader/reset",
+  );
+}
+
+async function resetUploader(db) {
+  await db.prepare("DELETE FROM files").run();
+  return redirectWithMessage("uploader を初期化しました");
+}
+
 // ---------- 2ch ----------
 
 async function getThreadInfo(db) {
@@ -136,8 +188,14 @@ async function abonPost(db, no) {
 async function deletePost(db, no) {
   const post = await db.prepare("SELECT no FROM posts WHERE no = ?").bind(no).first();
   if (!post) return notFound();
+  // 物理削除は末尾のみ。途中を消すと欠番になり、番号を持たない dat の行位置と
+  // レス番号がずれるため、最大番号でない指定は拒否する(あぼーんの no >= 2 と同じ考え方)。
+  const max = await db.prepare("SELECT COALESCE(MAX(no), 0) AS m FROM posts").first();
+  if (no !== max.m) {
+    return redirectWithMessage(`${no} 番は末尾ではないため物理削除できません`);
+  }
   // dat の出力は dat_lines を直接読むため、posts だけ消すと消した行が dat に残る。
-  // 物理削除では dat_lines の該当行も一緒に消す。番号は詰めない(欠番になる)。
+  // 物理削除では dat_lines の該当行も一緒に消す。
   await db.batch([
     db.prepare("DELETE FROM posts WHERE no = ?").bind(no),
     db.prepare("DELETE FROM dat_lines WHERE no = ?").bind(no),
@@ -145,16 +203,90 @@ async function deletePost(db, no) {
   return redirectWithMessage(`${no} 番を物理削除しました`);
 }
 
+async function resetExceptFirstConfirm(db) {
+  const row = await db.prepare("SELECT COUNT(*) AS c FROM posts WHERE no >= 2").first();
+  return confirmPage(
+    "2ch 1以外初期化",
+    `2 番以降の ${row.c} 件のレスを削除し、スレッドタイトルと 1 番だけを残します。`,
+    "/2ch/reset/except-first",
+  );
+}
+
+async function resetExceptFirst(db) {
+  await db.batch([
+    db.prepare("DELETE FROM posts WHERE no >= 2"),
+    db.prepare("DELETE FROM dat_lines WHERE no >= 2"),
+  ]);
+  return redirectWithMessage("2 番以降を削除しました");
+}
+
+async function resetAllConfirm(db) {
+  const row = await db.prepare("SELECT COUNT(*) AS c FROM posts").first();
+  return confirmPage(
+    "2ch 1含めて初期化",
+    `全 ${row.c} 件のレスとスレッドを削除し、初期化前の状態に戻します。`,
+    "/2ch/reset/all",
+  );
+}
+
+async function resetAll(db) {
+  await db.batch([
+    db.prepare("DELETE FROM posts"),
+    db.prepare("DELETE FROM dat_lines"),
+    db.prepare("DELETE FROM thread"),
+  ]);
+  return redirectWithMessage("スレッドを初期化しました");
+}
+
+// スレッドがないときだけ、init.sql と同じ内容で thread と 1 番を作る。
+async function createFirstPost(db, request) {
+  const form = await request.formData();
+  const title = String(form.get("title") ?? "").trim();
+  const message = String(form.get("message") ?? "").trim();
+  if (title === "" || message === "") {
+    return redirectWithMessage("タイトルと本文を入力してください");
+  }
+  if (message.length > 4096) {
+    return redirectWithMessage("本文が長すぎます(4096 文字まで)");
+  }
+  const count = await db.prepare("SELECT COUNT(*) AS c FROM posts").first();
+  if (count.c > 0) {
+    return redirectWithMessage("既にスレッドがあるため、1 番は作れません");
+  }
+  const now = Date.now();
+  await db.batch([
+    db.prepare("DELETE FROM thread"),
+    db.prepare("INSERT INTO thread (id, title, created_at, modified_at) VALUES (1, ?, ?, ?)").bind(title, now, now),
+    db.prepare(
+      "INSERT INTO posts (no, name, mail, date_text, poster_id, message, posted_at, source) VALUES (1, '名無しさん', '', ?, 'Admin001', ?, ?, 'web')",
+    ).bind(formatDateText(now), message, now),
+  ]);
+  return redirectWithMessage("スレッドを作成しました");
+}
+
 // ---------- 画面 ----------
 
 async function dashboard(env, url) {
   const msg = url.searchParams.get("msg");
-  const upDb = env.simple_uploader_db;
-  const bbsDb = env.simple_2ch_db;
-  const [summary, files, thread, posts] = await Promise.all([
-    uploaderSummary(upDb), listFiles(upDb), getThreadInfo(bbsDb), listPosts(bbsDb),
-  ]);
+  const up = await uploaderSection(env.simple_uploader_db);
+  const bbs = await chSection(env.simple_2ch_db);
+  return page("simple-admin", `
+<h1>simple-admin</h1>
+${msg ? `<p class="flash">${escapeHtml(msg)}</p>` : ""}
+${up}
+${bbs}
+`);
+}
 
+async function uploaderSection(db) {
+  if (!db) return `<h2>uploader</h2>\n<p>未対応です(バインディング simple_uploader_db がありません)。</p>`;
+  let summary, files;
+  try {
+    [summary, files] = await Promise.all([uploaderSummary(db), listFiles(db)]);
+  } catch (error) {
+    if (!isDbUnavailable(error)) throw error;
+    return `<h2>uploader</h2>\n<p>未対応です(データベースに接続できませんでした。database_id が simple-uploader-db を指しているか確認してください)。</p>`;
+  }
   const fileRows = files.map((f) => `<tr>
     <td>${f.file_no}</td><td>${escapeHtml(f.name)}</td><td>${f.size}</td>
     <td>${escapeHtml(f.comment)}</td><td>${formatJst(f.created_at)}</td>
@@ -162,33 +294,79 @@ async function dashboard(env, url) {
     <td>${f.has_password ? "あり" : "なし"}</td><td>${f.has_delete_key ? "あり" : "なし"}</td>
     <td>${f.status === "ready" ? `<a href="/uploader/files/${encodeURIComponent(f.id)}/download">強制ダウンロード</a> ` : ""}<form method="post" action="/uploader/files/${encodeURIComponent(f.id)}/delete" onsubmit="return confirm('このファイルを削除しますか？')"><button type="submit">強制削除</button></form></td>
   </tr>`).join("\n");
-
-  const postRows = posts.map((p) => `<tr>
-    <td>${p.no}</td><td>${escapeHtml(p.name)}</td><td>${escapeHtml(p.mail)}</td>
-    <td>${escapeHtml(p.date_text)}</td><td>${escapeHtml(p.poster_id)}</td>
-    <td class="msg">${escapeHtml(p.message)}</td>
-    <td>${p.no >= 2 ? `<form method="post" action="/2ch/posts/${p.no}/abon" onsubmit="return confirm('${p.no} 番をあぼーんしますか？')"><button type="submit">あぼーん</button></form> ` : ""}<form method="post" action="/2ch/posts/${p.no}/delete" onsubmit="return confirm('${p.no} 番を物理削除しますか？番号は詰めません。')"><button type="submit">物理削除</button></form></td>
-  </tr>`).join("\n");
-
-  return page("simple-admin", `
-<h1>simple-admin</h1>
-${msg ? `<p class="flash">${escapeHtml(msg)}</p>` : ""}
-<h2>uploader</h2>
+  return `<h2>uploader</h2>
 <p>ファイル ${summary.total} 件(公開 ${summary.ready} / アップロード中 ${summary.uploading})、合計 ${summary.bytes} バイト。最新 ${LIST_LIMIT} 件まで表示します。</p>
 <table>
 <tr><th>No.</th><th>名前</th><th>サイズ</th><th>コメント</th><th>日時(JST)</th><th>DL</th><th>状態</th><th>PW</th><th>削除キー</th><th>操作</th></tr>
 ${fileRows}
 </table>
-<h2>2ch</h2>
-${thread ? `<p>スレッド「${escapeHtml(thread.title)}」 レス ${thread.count} 件(最大番号 ${thread.lastNo})。最新 ${LIST_LIMIT} 件まで表示します。</p>
+<p><form method="get" action="/uploader/reset"><button type="submit">uploader を初期化</button></form></p>`;
+}
+
+async function chSection(db) {
+  if (!db) return `<h2>2ch</h2>\n<p>未対応です(バインディング simple_2ch_db がありません)。</p>`;
+  let thread, posts;
+  try {
+    [thread, posts] = await Promise.all([getThreadInfo(db), listPosts(db)]);
+  } catch (error) {
+    if (!isDbUnavailable(error)) throw error;
+    return `<h2>2ch</h2>\n<p>未対応です(データベースに接続できませんでした。database_id が simple-2ch-db を指しているか確認してください)。</p>`;
+  }
+  const postRows = posts.map((p) => `<tr>
+    <td>${p.no}</td><td>${escapeHtml(p.name)}</td><td>${escapeHtml(p.mail)}</td>
+    <td>${escapeHtml(p.date_text)}</td><td>${escapeHtml(p.poster_id)}</td>
+    <td class="msg">${escapeHtml(p.message)}</td>
+    <td>${p.no >= 2 ? `<form method="post" action="/2ch/posts/${p.no}/abon" onsubmit="return confirm('${p.no} 番をあぼーんしますか？')"><button type="submit">あぼーん</button></form> ` : ""}${thread && p.no === thread.lastNo ? `<form method="post" action="/2ch/posts/${p.no}/delete" onsubmit="return confirm('${p.no} 番(末尾)を物理削除しますか？')"><button type="submit">物理削除</button></form>` : ""}</td>
+  </tr>`).join("\n");
+  if (!thread || thread.count === 0) {
+    return `<h2>2ch</h2>
+<p>スレッドがありません。最初のレスを作成します。</p>
+<form method="post" action="/2ch/first-post">
+<p>タイトル <input type="text" name="title" size="60"></p>
+<p>本文<br><textarea name="message" rows="4" cols="60"></textarea></p>
+<p><button type="submit">1 番を作成</button></p>
+</form>`;
+  }
+  return `<h2>2ch</h2>
+<p>スレッド「${escapeHtml(thread.title)}」 レス ${thread.count} 件(最大番号 ${thread.lastNo})。最新 ${LIST_LIMIT} 件まで表示します。</p>
 <table>
 <tr><th>No.</th><th>名前</th><th>メール</th><th>日付</th><th>ID</th><th>本文</th><th>操作</th></tr>
 ${postRows}
-</table>` : "<p>スレッドがありません。</p>"}
-`);
+</table>
+<p><form method="get" action="/2ch/reset/except-first"><button type="submit">1以外初期化</button></form>
+<form method="get" action="/2ch/reset/all"><button type="submit">1含めて初期化</button></form></p>`;
 }
 
 // ---------- ルーター ----------
+
+function routeUploader(db, path, method) {
+  const download = /^\/uploader\/files\/([^/]+)\/download$/.exec(path);
+  if (method === "GET" && download) return forceDownload(db, decodeURIComponent(download[1]));
+
+  const delFile = /^\/uploader\/files\/([^/]+)\/delete$/.exec(path);
+  if (method === "POST" && delFile) return forceDeleteFile(db, decodeURIComponent(delFile[1]));
+
+  if (method === "GET" && path === "/uploader/reset") return resetUploaderConfirm(db);
+  if (method === "POST" && path === "/uploader/reset") return resetUploader(db);
+
+  return notFound();
+}
+
+function route2ch(db, request, path, method) {
+  const abon = /^\/2ch\/posts\/(\d+)\/abon$/.exec(path);
+  if (method === "POST" && abon) return abonPost(db, Number(abon[1]));
+
+  const delPost = /^\/2ch\/posts\/(\d+)\/delete$/.exec(path);
+  if (method === "POST" && delPost) return deletePost(db, Number(delPost[1]));
+
+  if (method === "GET" && path === "/2ch/reset/except-first") return resetExceptFirstConfirm(db);
+  if (method === "POST" && path === "/2ch/reset/except-first") return resetExceptFirst(db);
+  if (method === "GET" && path === "/2ch/reset/all") return resetAllConfirm(db);
+  if (method === "POST" && path === "/2ch/reset/all") return resetAll(db);
+  if (method === "POST" && path === "/2ch/first-post") return createFirstPost(db, request);
+
+  return notFound();
+}
 
 async function route(request, env, url) {
   const path = url.pathname;
@@ -196,17 +374,25 @@ async function route(request, env, url) {
 
   if (method === "GET" && path === "/") return dashboard(env, url);
 
-  const download = /^\/uploader\/files\/([^/]+)\/download$/.exec(path);
-  if (method === "GET" && download) return forceDownload(env.simple_uploader_db, decodeURIComponent(download[1]));
-
-  const delFile = /^\/uploader\/files\/([^/]+)\/delete$/.exec(path);
-  if (method === "POST" && delFile) return forceDeleteFile(env.simple_uploader_db, decodeURIComponent(delFile[1]));
-
-  const abon = /^\/2ch\/posts\/(\d+)\/abon$/.exec(path);
-  if (method === "POST" && abon) return abonPost(env.simple_2ch_db, Number(abon[1]));
-
-  const delPost = /^\/2ch\/posts\/(\d+)\/delete$/.exec(path);
-  if (method === "POST" && delPost) return deletePost(env.simple_2ch_db, Number(delPost[1]));
+  // 左右は独立。片方の DB に繋がらなくても、もう片方と画面自体は落とさない。
+  if (path.startsWith("/uploader")) {
+    if (!env.simple_uploader_db) return unavailablePage("uploader");
+    try {
+      return await routeUploader(env.simple_uploader_db, path, method);
+    } catch (error) {
+      if (isDbUnavailable(error)) return unavailablePage("uploader");
+      throw error;
+    }
+  }
+  if (path.startsWith("/2ch")) {
+    if (!env.simple_2ch_db) return unavailablePage("2ch");
+    try {
+      return await route2ch(env.simple_2ch_db, request, path, method);
+    } catch (error) {
+      if (isDbUnavailable(error)) return unavailablePage("2ch");
+      throw error;
+    }
+  }
 
   return notFound();
 }

@@ -17,12 +17,18 @@ cloudflare-simple-uploader と cloudflare-simple-2ch のための GUI 管理 Wor
   - 強制削除: 削除キーの有無にかかわらず削除します。処理は uploader の ADMIN.md と同じで、
     files の行を消し、file_chunks / file_download_tokens / file_auth_attempts は
     ON DELETE CASCADE で消えます
+  - 初期化: 全ファイルを削除して空に戻します(確認画面あり)。次のアップロードは No.1 からです
 - 2ch
   - あぼーん: 2ch の ADMIN.md のテンプレートどおり、posts の名前・メール・日付・ID・本文を
     書き換えます。dat キャッシュ(dat_lines)には触れません(アプリが読み取り時に直します)。
     1 番は対象外です
-  - 物理削除: posts と dat_lines の両方から行を消します。**番号は詰めないため欠番になります。**
-    1 番を物理削除すると、dat の1行目が持つスレッドタイトルが dat から失われます
+  - 物理削除: **末尾のレスのみ**対象です。posts と dat_lines の両方から行を消します。
+    途中を消すと欠番になり、番号を持たない dat の行位置とレス番号がずれるため、
+    末尾でない番号は指定しても拒否されます。最後の1件を消すとスレッドなしの状態に戻ります
+  - 1以外初期化: 2 番以降を全て削除し、タイトルと 1 番だけを残します(確認画面あり)
+  - 1含めて初期化: 全レスとスレッドを削除し、初期化前の状態に戻します(確認画面あり)
+  - 1 番の作成: スレッドがないときだけダッシュボードにフォームが出ます。init.sql と同じく
+    thread と 1 番(名無しさん / ID: Admin001)を作成します。日付は実行時点の JST です
 
 ## セットアップ
 
@@ -34,14 +40,12 @@ cp wrangler.example.jsonc wrangler.jsonc
 npx wrangler d1 list   # 2つのデータベースの id を確認する
 ```
 
-`wrangler.jsonc` に、確認した id で2つのバインディングを書きます。
+コピーした `wrangler.jsonc` の `d1_databases` にある2か所の
+`database_id` のプレースホルダを、確認した id に置き換えます
+(`simple-uploader-db` と `simple-2ch-db` を取り違えないよう注意)。
 
-```jsonc
-"d1_databases": [
-  { "binding": "simple_uploader_db", "database_name": "simple-uploader-db", "database_id": "<id>" },
-  { "binding": "simple_2ch_db", "database_name": "simple-2ch-db", "database_id": "<id>" }
-]
-```
+片方しか使わない、または片方の id が間違っている場合、その側はダッシュボードで
+「未対応」と表示され、その側の操作は 503 になります。もう片方はそのまま使えます。
 
 デプロイと Access の設定:
 
