@@ -7,8 +7,9 @@ cloudflare-simple-uploader と cloudflare-simple-2ch のための GUI 管理 Wor
 
 HTTP Basic 認証をかけています。
 
-- ID: メールアドレスっぽい文字列なら何でも構いません(@ の後ろにピリオドが
-  1つあるかだけを正規表現で確認します)。許可リストはありません
+- ID: メールアドレスっぽい文字列なら何でも構いません(形の判定は
+  cloudflare-simple-ai と同じく、HTML 仕様(WHATWG)の「valid email address」の
+  正規表現で確認します)。許可リストはありません
 - パスワード: デプロイ時に `wrangler secret put ADMIN_PASSWORD` で設定した
   ものと照合します。**実質はパスワードのみの認証です。** ID は、誰が入ったかを
   ログに残すための名乗りとして扱います(admin や root の固定 ID よりはマシ、

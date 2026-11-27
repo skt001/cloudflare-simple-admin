@@ -1,7 +1,8 @@
 // admin: cloudflare-simple-uploader と cloudflare-simple-2ch の管理用 Worker。
 //
 // 認証は HTTP Basic 認証。ID はメールアドレスっぽい文字列なら何でもよく
-// (@ の後ろにピリオドがあるか程度だけを正規表現で見る)、実質はパスワードのみで
+// (形の判定は cloudflare-simple-ai と同じく、HTML 仕様(WHATWG)の
+// 「valid email address」の正規表現で見る)、実質はパスワードのみで
 // 認証する。パスワードは ADMIN_PASSWORD シークレットと照合し、未設定なら全て
 // 拒否する。ログイン試行は simple_admin_db の access_log に残す(README 参照)。
 // 管理操作は各プロジェクトの ADMIN.md の手順(SQL)を、そのまま GUI から実行する:
@@ -73,9 +74,11 @@ function unavailablePage(name) {
 
 // ---------- 認証 ----------
 
-// メールアドレスっぽさの判定はこれだけ(@ の後ろにピリオドが1つあること)。
+// メールアドレスっぽさの判定は、cloudflare-simple-ai と同じ WHATWG の
+// 「valid email address」の正規表現。RFC 5322 の簡略版で、ドメインに
+// ドットは不要だが、ラベルのハイフンの位置などの不正な形は弾く。
 // 許可リストはなく、ID はログに残すための名乗りとして扱う。実質の認証はパスワードのみ。
-const EMAIL_LIKE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const EMAIL_LIKE = /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
 
 function parseBasicAuth(request) {
   const header = request.headers.get("Authorization") ?? "";
