@@ -25,6 +25,16 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+// 2ch 本体の保存形式(ADMIN.md 参照): タイトル・名前・本文は & < > を
+// エスケープした値で DB に書く。表示側はその前提で組み立てるため、
+// 生のまま書くと二重にほどけたり、板の HTML に生タグが混ざったりする。
+function escapeStored(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
 function formatJst(ms) {
   if (!Number.isFinite(ms)) return "";
   const d = new Date(ms + JST_OFFSET_MS);
@@ -178,12 +188,18 @@ async function forceDownload(db, id) {
     },
   });
   const fallback = file.name.replace(/[^\x20-\x7e]/g, "_").replaceAll('"', "_");
+  // filename* の追加エンコードは uploader 本体の contentDisposition に合わせる
+  // (encodeURIComponent が素通しする ' ( ) * も %xx にする)。
+  const encoded = encodeURIComponent(file.name).replace(
+    /['()*]/g,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
   return new Response(stream, {
     status: 200,
     headers: {
       "Content-Type": "application/octet-stream",
       "Content-Length": String(file.size),
-      "Content-Disposition": `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+      "Content-Disposition": `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`,
       "Cache-Control": "no-store",
     },
   });
@@ -314,10 +330,10 @@ async function createFirstPost(db, request) {
   const now = Date.now();
   await db.batch([
     db.prepare("DELETE FROM thread"),
-    db.prepare("INSERT INTO thread (id, title, created_at, modified_at) VALUES (1, ?, ?, ?)").bind(title, now, now),
+    db.prepare("INSERT INTO thread (id, title, created_at, modified_at) VALUES (1, ?, ?, ?)").bind(escapeStored(title), now, now),
     db.prepare(
       "INSERT INTO posts (no, name, mail, date_text, poster_id, message, posted_at, source) VALUES (1, '名無しさん', '', ?, 'Admin001', ?, ?, 'web')",
-    ).bind(formatDateText(now), message, now),
+    ).bind(formatDateText(now), escapeStored(message), now),
   ]);
   return redirectWithMessage("スレッドを作成しました");
 }
@@ -420,6 +436,31 @@ ${postRows}
 <form method="get" action="/2ch/reset/all"><button type="submit">1含めて初期化</button></form></p>`;
 }
 
+// ---------- POST の自オリジンチェック ----------
+
+// Basic 認証はブラウザがオリジン単位で自動送信するため、ログイン中に
+// 悪意あるサイトのフォームから POST される余地がある。POST のときは
+// Origin(なければ Referer)が自オリジンかどうかを確認する。どちらも
+// ない場合はブラウザ以外のクライアントとして通す。
+function isSameOrigin(request, url) {
+  const origin = request.headers.get("Origin");
+  const referer = request.headers.get("Referer");
+  const source = origin ?? referer;
+  if (!source) return true;
+  try {
+    return new URL(source).host === url.host;
+  } catch {
+    return false;
+  }
+}
+
+function forbidden() {
+  return new Response("Forbidden\n", {
+    status: 403,
+    headers: { "Content-Type": "text/plain; charset=UTF-8", "Cache-Control": "no-store" },
+  });
+}
+
 // ---------- ルーター ----------
 
 function routeUploader(db, path, method) {
@@ -508,6 +549,9 @@ export default {
             "Cache-Control": "no-store",
           },
         });
+      }
+      if (request.method === "POST" && !isSameOrigin(request, url)) {
+        return forbidden();
       }
       return await route(request, env, url);
     } catch (error) {

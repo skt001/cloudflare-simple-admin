@@ -118,6 +118,20 @@ test("2ch 物理削除: レスが 1 件だけのとき 1 番は消せず、ボ�
   assert.equal(db.prepare("SELECT COUNT(*) AS c FROM posts WHERE no = 1").get().c, 1);
 });
 
+test("POST の自オリジンチェック: 別オリジンの Origin / Referer は 403、自オリジンと無指定は通る", async () => {
+  const env = seededEnv();
+  const path = `/uploader/files/${FILE_ID}/delete`;
+  const evilOrigin = await call(env, path, { method: "POST", headers: { Origin: "https://evil.example.test" } });
+  assert.equal(evilOrigin.status, 403);
+  const evilReferer = await call(env, path, { method: "POST", headers: { Referer: "https://evil.example.test/page" } });
+  assert.equal(evilReferer.status, 403);
+  // 403 の間はファイルが消えていない
+  assert.equal(env.simple_uploader_db.sqlite.prepare("SELECT COUNT(*) AS c FROM files WHERE id = ?").get(FILE_ID).c, 1);
+  const sameOrigin = await call(env, path, { method: "POST", headers: { Origin: "https://admin.example.test" } });
+  assert.equal(sameOrigin.status, 303);
+  assert.equal(env.simple_uploader_db.sqlite.prepare("SELECT COUNT(*) AS c FROM files WHERE id = ?").get(FILE_ID).c, 0);
+});
+
 test("未知のパスは 404", async () => {
   assert.equal((await call(seededEnv(), "/nope")).status, 404);
 });
@@ -243,9 +257,9 @@ test("認証: パスワード違いは 401 で、失敗が記録される", asyn
   assert.equal(rows[0].ok, 0);
 });
 
-test("認証: @ の後ろにピリオドがない ID は、正しいパスワードでも 401", async () => {
+test("認証: @ の後ろにピリオドがない ID は WHATWG の形として通し、@ のない ID は 401", async () => {
   const env = seededEnv();
-  assert.equal((await callRaw(env, "/", basic("someone@localhost", TEST_PASSWORD))).status, 401);
+  assert.equal((await callRaw(env, "/", basic("someone@localhost", TEST_PASSWORD))).status, 200);
   assert.equal((await callRaw(env, "/", basic("admin", TEST_PASSWORD))).status, 401);
 });
 
